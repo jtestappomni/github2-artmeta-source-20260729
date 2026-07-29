@@ -182,8 +182,8 @@ jobs:
 
           storage_route='https://api.github.com/orgs/jtestappomni/artifacts/metadata/storage-record'
           deployment_route='https://api.github.com/orgs/jtestappomni/artifacts/metadata/deployment-record'
-          source_repo='jtestappomni/github2-artmeta-source-20260729'
-          victim_repo='jtestappomni/github2-artmeta-victim-20260729'
+          source_repo='github2-artmeta-source-20260729'
+          victim_repo='github2-artmeta-victim-20260729'
 
           api_post storage-source-provenance-victim-field "$storage_route" \
             "$(storage_body source-provenance-victim-field "$SOURCE_STORAGE" "$victim_repo")"
