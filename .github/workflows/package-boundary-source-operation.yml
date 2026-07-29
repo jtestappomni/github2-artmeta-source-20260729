@@ -119,13 +119,18 @@ jobs:
               }' > "${package_dir}/package.json"
             printf 'module.exports = %s;\n' "$(jq -Rn --arg marker "${label}-${PROBE_TAG}" '$marker')" \
               > "${package_dir}/index.js"
-            (
+            local publish_rc
+            if (
               cd "$package_dir" || exit 91
               NODE_AUTH_TOKEN="$GH_TOKEN_VALUE" \
                 NPM_CONFIG_USERCONFIG="$npm_cfg" \
                 npm publish --ignore-scripts --registry https://npm.pkg.github.com
             ) > "evidence/${label}.publish.raw.log" 2>&1
-            local publish_rc=$?
+            then
+              publish_rc=0
+            else
+              publish_rc=$?
+            fi
             sanitize_log < "evidence/${label}.publish.raw.log" > "evidence/${label}.publish.log"
             rm -f "evidence/${label}.publish.raw.log"
             printf '%s\n' "$publish_rc" > "evidence/${label}.publish.rc"
@@ -134,11 +139,16 @@ jobs:
           npm_view() {
             local label="$1"
             local package_spec="$2"
-            NODE_AUTH_TOKEN="$GH_TOKEN_VALUE" \
+            local view_rc
+            if NODE_AUTH_TOKEN="$GH_TOKEN_VALUE" \
               NPM_CONFIG_USERCONFIG="$npm_cfg" \
               npm view "$package_spec" version --registry https://npm.pkg.github.com \
               > "evidence/${label}.view.raw.log" 2>&1
-            local view_rc=$?
+            then
+              view_rc=0
+            else
+              view_rc=$?
+            fi
             sanitize_log < "evidence/${label}.view.raw.log" > "evidence/${label}.view.log"
             rm -f "evidence/${label}.view.raw.log"
             printf '%s\n' "$view_rc" > "evidence/${label}.view.rc"
