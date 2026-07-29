@@ -257,7 +257,7 @@ jobs:
               ;;
 
             publish)
-              publish_package cross-publish-victim "$active_victim" 9.9.29-package-scope.1 "$victim_repo"
+              publish_package cross-publish-victim "$active_victim" 9.9.29 "$victim_repo"
               cross_status="$(tr -d '\r\n' < evidence/cross-publish-victim.publish.rc)"
               if [ "$cross_status" = "0" ]
               then
