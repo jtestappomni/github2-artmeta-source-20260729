@@ -328,10 +328,9 @@ jobs:
             job_id="$(jq -r '.job_id // empty' "evidence/${label}.response.json")"
             if [[ -n "$job_id" ]]
             then
-              cluster="${label#jobs-}"
               api_get \
                 "${label}-poll" \
-                "https://api.github.com/orgs/jtestappomni/artifacts/metadata/deployment-record/cluster/github2-${cluster}-20260729/jobs/${job_id}"
+                "https://api.github.com/orgs/jtestappomni/artifacts/metadata/deployment-record/cluster/github2-${label}-20260729/jobs/${job_id}"
             fi
           done
 
