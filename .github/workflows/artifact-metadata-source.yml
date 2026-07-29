@@ -1,0 +1,368 @@
+name: Artifact metadata source authorization matrix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+jobs:
+  run-source-matrix:
+    runs-on:
+      - self-hosted
+      - github2-artmeta-source-20260729
+    steps:
+      - name: Prepare source and victim digest controls
+        id: fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p subjects evidence
+
+          printf '%s' 'github2-artmeta-source-storage-20260729-v1' > subjects/source-storage.txt
+          printf '%s' 'github2-artmeta-source-deployment-20260729-v1' > subjects/source-deployment.txt
+          printf '%s' 'github2-artmeta-source-cluster-20260729-v1' > subjects/source-cluster.txt
+          printf '%s' 'github2-artmeta-source-job-20260729-v1' > subjects/source-job.txt
+
+          printf '%s' 'github2-artmeta-victim-storage-20260729-v1' > subjects/victim-storage-control.txt
+          printf '%s' 'github2-artmeta-victim-deployment-20260729-v1' > subjects/victim-deployment-control.txt
+          printf '%s' 'github2-artmeta-victim-cluster-20260729-v1' > subjects/victim-cluster-control.txt
+          printf '%s' 'github2-artmeta-victim-job-20260729-v1' > subjects/victim-job-control.txt
+
+          printf '%s' 'github2-artmeta-no-provenance-storage-source-20260729' > subjects/no-provenance-storage-source.txt
+          printf '%s' 'github2-artmeta-no-provenance-storage-victim-20260729' > subjects/no-provenance-storage-victim.txt
+          printf '%s' 'github2-artmeta-no-provenance-deploy-source-20260729' > subjects/no-provenance-deploy-source.txt
+          printf '%s' 'github2-artmeta-no-provenance-deploy-victim-20260729' > subjects/no-provenance-deploy-victim.txt
+
+          {
+            printf 'source_storage=sha256:%s\n' "$(shasum -a 256 subjects/source-storage.txt | cut -d ' ' -f 1)"
+            printf 'source_deployment=sha256:%s\n' "$(shasum -a 256 subjects/source-deployment.txt | cut -d ' ' -f 1)"
+            printf 'source_cluster=sha256:%s\n' "$(shasum -a 256 subjects/source-cluster.txt | cut -d ' ' -f 1)"
+            printf 'source_job=sha256:%s\n' "$(shasum -a 256 subjects/source-job.txt | cut -d ' ' -f 1)"
+            printf 'victim_storage=sha256:%s\n' "$(shasum -a 256 subjects/victim-storage-control.txt | cut -d ' ' -f 1)"
+            printf 'victim_deployment=sha256:%s\n' "$(shasum -a 256 subjects/victim-deployment-control.txt | cut -d ' ' -f 1)"
+            printf 'victim_cluster=sha256:%s\n' "$(shasum -a 256 subjects/victim-cluster-control.txt | cut -d ' ' -f 1)"
+            printf 'victim_job=sha256:%s\n' "$(shasum -a 256 subjects/victim-job-control.txt | cut -d ' ' -f 1)"
+            printf 'noprov_storage_source=sha256:%s\n' "$(shasum -a 256 subjects/no-provenance-storage-source.txt | cut -d ' ' -f 1)"
+            printf 'noprov_storage_victim=sha256:%s\n' "$(shasum -a 256 subjects/no-provenance-storage-victim.txt | cut -d ' ' -f 1)"
+            printf 'noprov_deploy_source=sha256:%s\n' "$(shasum -a 256 subjects/no-provenance-deploy-source.txt | cut -d ' ' -f 1)"
+            printf 'noprov_deploy_victim=sha256:%s\n' "$(shasum -a 256 subjects/no-provenance-deploy-victim.txt | cut -d ' ' -f 1)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Attest source storage subject
+        uses: actions/attest@v4
+        with:
+          subject-path: subjects/source-storage.txt
+
+      - name: Attest source deployment subject
+        uses: actions/attest@v4
+        with:
+          subject-path: subjects/source-deployment.txt
+
+      - name: Attest source cluster subject
+        uses: actions/attest@v4
+        with:
+          subject-path: subjects/source-cluster.txt
+
+      - name: Attest source job subject
+        uses: actions/attest@v4
+        with:
+          subject-path: subjects/source-job.txt
+
+      - name: Run org-scoped metadata matrix
+        shell: bash
+        env:
+          GH_TOKEN_VALUE: ${{ github.token }}
+          SOURCE_STORAGE: ${{ steps.fixtures.outputs.source_storage }}
+          SOURCE_DEPLOYMENT: ${{ steps.fixtures.outputs.source_deployment }}
+          SOURCE_CLUSTER: ${{ steps.fixtures.outputs.source_cluster }}
+          SOURCE_JOB: ${{ steps.fixtures.outputs.source_job }}
+          VICTIM_STORAGE: ${{ steps.fixtures.outputs.victim_storage }}
+          VICTIM_DEPLOYMENT: ${{ steps.fixtures.outputs.victim_deployment }}
+          VICTIM_CLUSTER: ${{ steps.fixtures.outputs.victim_cluster }}
+          VICTIM_JOB: ${{ steps.fixtures.outputs.victim_job }}
+          NOPROV_STORAGE_SOURCE: ${{ steps.fixtures.outputs.noprov_storage_source }}
+          NOPROV_STORAGE_VICTIM: ${{ steps.fixtures.outputs.noprov_storage_victim }}
+          NOPROV_DEPLOY_SOURCE: ${{ steps.fixtures.outputs.noprov_deploy_source }}
+          NOPROV_DEPLOY_VICTIM: ${{ steps.fixtures.outputs.noprov_deploy_victim }}
+        run: |
+          set -euo pipefail
+          auth_cfg="$RUNNER_TEMP/github-api-auth.cfg"
+          umask 077
+          {
+            printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN_VALUE"
+            printf 'header = "Accept: application/vnd.github+json"\n'
+            printf 'header = "X-GitHub-Api-Version: 2026-03-10"\n'
+            printf 'header = "X-Bug-Bounty: rez0"\n'
+            printf 'header = "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"\n'
+          } > "$auth_cfg"
+
+          api_post() {
+            local label="$1"
+            local route="$2"
+            local body="$3"
+            local request_file="evidence/${label}.request.json"
+            local response_file="evidence/${label}.response.json"
+            local status_file="evidence/${label}.status"
+            printf '%s\n' "$body" > "$request_file"
+            curl -sS \
+              --proxy http://127.0.0.1:8080 \
+              --config "$auth_cfg" \
+              -X POST \
+              -H 'Content-Type: application/json' \
+              --data-binary "@$request_file" \
+              -o "$response_file" \
+              -w '%{http_code}\n' \
+              "$route" > "$status_file"
+          }
+
+          api_get() {
+            local label="$1"
+            local route="$2"
+            curl -sS \
+              --proxy http://127.0.0.1:8080 \
+              --config "$auth_cfg" \
+              -o "evidence/${label}.response.json" \
+              -w '%{http_code}\n' \
+              "$route" > "evidence/${label}.status"
+          }
+
+          storage_body() {
+            local name="$1"
+            local digest="$2"
+            local github_repository="$3"
+            jq -nc \
+              --arg name "$name" \
+              --arg digest "$digest" \
+              --arg github_repository "$github_repository" \
+              '{
+                name:$name,
+                version:"1.0.0",
+                digest:$digest,
+                artifact_url:("https://example.invalid/github2/" + $name),
+                registry_url:"https://example.invalid/",
+                repository:"github2-source-registry",
+                status:"active",
+                github_repository:$github_repository,
+                return_records:true
+              }'
+          }
+
+          deployment_body() {
+            local name="$1"
+            local digest="$2"
+            local github_repository="$3"
+            local cluster="$4"
+            local deployment_name="$5"
+            local marker="$6"
+            jq -nc \
+              --arg name "$name" \
+              --arg digest "$digest" \
+              --arg github_repository "$github_repository" \
+              --arg cluster "$cluster" \
+              --arg deployment_name "$deployment_name" \
+              --arg marker "$marker" \
+              '{
+                name:$name,
+                version:"1.0.0",
+                digest:$digest,
+                status:"deployed",
+                logical_environment:"github2-prod",
+                physical_environment:"github2-east",
+                cluster:$cluster,
+                deployment_name:$deployment_name,
+                tags:{marker:$marker},
+                github_repository:$github_repository,
+                return_records:true
+              }'
+          }
+
+          storage_route='https://api.github.com/orgs/jtestappomni/artifacts/metadata/storage-record'
+          deployment_route='https://api.github.com/orgs/jtestappomni/artifacts/metadata/deployment-record'
+          source_repo='jtestappomni/github2-artmeta-source-20260729'
+          victim_repo='jtestappomni/github2-artmeta-victim-20260729'
+
+          api_post storage-source-provenance-victim-field "$storage_route" \
+            "$(storage_body source-provenance-victim-field "$SOURCE_STORAGE" "$victim_repo")"
+          api_post storage-victim-provenance-source-field "$storage_route" \
+            "$(storage_body victim-provenance-source-field "$VICTIM_STORAGE" "$source_repo")"
+          api_post storage-victim-provenance-victim-field "$storage_route" \
+            "$(storage_body victim-provenance-victim-field "$VICTIM_STORAGE" "$victim_repo")"
+          api_post storage-noprov-source-field "$storage_route" \
+            "$(storage_body noprov-source-field "$NOPROV_STORAGE_SOURCE" "$source_repo")"
+          api_post storage-noprov-victim-field "$storage_route" \
+            "$(storage_body noprov-victim-field "$NOPROV_STORAGE_VICTIM" "$victim_repo")"
+
+          api_post deployment-source-provenance-victim-field "$deployment_route" \
+            "$(deployment_body source-provenance-victim-field "$SOURCE_DEPLOYMENT" "$victim_repo" github2-source-positive-20260729 source-positive source-positive)"
+          api_post deployment-victim-provenance-source-field "$deployment_route" \
+            "$(deployment_body victim-provenance-source-field "$VICTIM_DEPLOYMENT" "$source_repo" github2-victim-direct-source-field-20260729 victim-source-field victim-source-field)"
+          api_post deployment-victim-provenance-victim-field "$deployment_route" \
+            "$(deployment_body victim-provenance-victim-field "$VICTIM_DEPLOYMENT" "$victim_repo" github2-victim-direct-victim-field-20260729 victim-victim-field victim-victim-field)"
+          api_post deployment-noprov-source-field "$deployment_route" \
+            "$(deployment_body noprov-source-field "$NOPROV_DEPLOY_SOURCE" "$source_repo" github2-noprov-source-20260729 noprov-source noprov-source)"
+          api_post deployment-noprov-victim-field "$deployment_route" \
+            "$(deployment_body noprov-victim-field "$NOPROV_DEPLOY_VICTIM" "$victim_repo" github2-noprov-victim-20260729 noprov-victim noprov-victim)"
+
+          api_post deployment-shared-slot-source-digest "$deployment_route" \
+            "$(deployment_body shared-slot-source-digest "$SOURCE_DEPLOYMENT" "$source_repo" github2-shared-slot-20260729 shared-slot source-overwrite-attempt)"
+          api_post deployment-shared-slot-victim-digest "$deployment_route" \
+            "$(deployment_body shared-slot-victim-digest "$VICTIM_DEPLOYMENT" "$victim_repo" github2-shared-slot-20260729 shared-slot victim-digest-update-attempt)"
+
+          cluster_body() {
+            local first_repo="$1"
+            local first_name="$2"
+            local first_digest="$3"
+            local first_deployment="$4"
+            local second_repo="$5"
+            local second_name="$6"
+            local second_digest="$7"
+            local second_deployment="$8"
+            local partial_success="$9"
+            jq -nc \
+              --arg first_repo "$first_repo" \
+              --arg first_name "$first_name" \
+              --arg first_digest "$first_digest" \
+              --arg first_deployment "$first_deployment" \
+              --arg second_repo "$second_repo" \
+              --arg second_name "$second_name" \
+              --arg second_digest "$second_digest" \
+              --arg second_deployment "$second_deployment" \
+              --argjson partial_success "$partial_success" \
+              '{
+                logical_environment:"github2-prod",
+                physical_environment:"github2-east",
+                deployments:[
+                  {
+                    name:$first_name,
+                    digest:$first_digest,
+                    version:"1.0.0",
+                    status:"deployed",
+                    deployment_name:$first_deployment,
+                    github_repository:$first_repo,
+                    tags:{order:"first"}
+                  },
+                  {
+                    name:$second_name,
+                    digest:$second_digest,
+                    version:"1.0.0",
+                    status:"deployed",
+                    deployment_name:$second_deployment,
+                    github_repository:$second_repo,
+                    tags:{order:"second"}
+                  }
+                ],
+                partial_success:$partial_success,
+                return_records:true
+              }'
+          }
+
+          api_post cluster-false-source-victim \
+            'https://api.github.com/orgs/jtestappomni/artifacts/metadata/deployment-record/cluster/github2-false-source-victim-20260729' \
+            "$(cluster_body "$source_repo" source-false-first "$SOURCE_CLUSTER" source-false-first "$victim_repo" victim-false-second "$VICTIM_CLUSTER" victim-false-second false)"
+          api_post cluster-false-victim-source \
+            'https://api.github.com/orgs/jtestappomni/artifacts/metadata/deployment-record/cluster/github2-false-victim-source-20260729' \
+            "$(cluster_body "$victim_repo" victim-false-first "$VICTIM_CLUSTER" victim-false-first "$source_repo" source-false-second "$SOURCE_CLUSTER" source-false-second false)"
+          api_post cluster-true-source-victim \
+            'https://api.github.com/orgs/jtestappomni/artifacts/metadata/deployment-record/cluster/github2-true-source-victim-20260729' \
+            "$(cluster_body "$source_repo" source-true-first "$SOURCE_CLUSTER" source-true-first "$victim_repo" victim-true-second "$VICTIM_CLUSTER" victim-true-second true)"
+          api_post cluster-true-victim-source \
+            'https://api.github.com/orgs/jtestappomni/artifacts/metadata/deployment-record/cluster/github2-true-victim-source-20260729' \
+            "$(cluster_body "$victim_repo" victim-true-first "$VICTIM_CLUSTER" victim-true-first "$source_repo" source-true-second "$SOURCE_CLUSTER" source-true-second true)"
+
+          job_body() {
+            local first_repo="$1"
+            local first_name="$2"
+            local first_digest="$3"
+            local first_deployment="$4"
+            local second_repo="$5"
+            local second_name="$6"
+            local second_digest="$7"
+            local second_deployment="$8"
+            jq -nc \
+              --arg first_repo "$first_repo" \
+              --arg first_name "$first_name" \
+              --arg first_digest "$first_digest" \
+              --arg first_deployment "$first_deployment" \
+              --arg second_repo "$second_repo" \
+              --arg second_name "$second_name" \
+              --arg second_digest "$second_digest" \
+              --arg second_deployment "$second_deployment" \
+              '{
+                logical_environment:"github2-prod",
+                physical_environment:"github2-east",
+                deployments:[
+                  {
+                    name:$first_name,
+                    digest:$first_digest,
+                    version:"1.0.0",
+                    status:"deployed",
+                    deployment_name:$first_deployment,
+                    github_repository:$first_repo
+                  },
+                  {
+                    name:$second_name,
+                    digest:$second_digest,
+                    version:"1.0.0",
+                    status:"deployed",
+                    deployment_name:$second_deployment,
+                    github_repository:$second_repo
+                  }
+                ]
+              }'
+          }
+
+          api_post jobs-source-victim \
+            'https://api.github.com/orgs/jtestappomni/artifacts/metadata/deployment-record/cluster/github2-jobs-source-victim-20260729/jobs' \
+            "$(job_body "$source_repo" source-job-first "$SOURCE_JOB" source-job-first "$victim_repo" victim-job-second "$VICTIM_JOB" victim-job-second)"
+          api_post jobs-victim-source \
+            'https://api.github.com/orgs/jtestappomni/artifacts/metadata/deployment-record/cluster/github2-jobs-victim-source-20260729/jobs' \
+            "$(job_body "$victim_repo" victim-job-first "$VICTIM_JOB" victim-job-first "$source_repo" source-job-second "$SOURCE_JOB" source-job-second)"
+
+          sleep 5
+          for label in jobs-source-victim jobs-victim-source
+          do
+            job_id="$(jq -r '.job_id // empty' "evidence/${label}.response.json")"
+            if [[ -n "$job_id" ]]
+            then
+              cluster="${label#jobs-}"
+              api_get \
+                "${label}-poll" \
+                "https://api.github.com/orgs/jtestappomni/artifacts/metadata/deployment-record/cluster/github2-${cluster}-20260729/jobs/${job_id}"
+            fi
+          done
+
+          jq -n \
+            --arg source_storage "$SOURCE_STORAGE" \
+            --arg source_deployment "$SOURCE_DEPLOYMENT" \
+            --arg source_cluster "$SOURCE_CLUSTER" \
+            --arg source_job "$SOURCE_JOB" \
+            --arg victim_storage "$VICTIM_STORAGE" \
+            --arg victim_deployment "$VICTIM_DEPLOYMENT" \
+            --arg victim_cluster "$VICTIM_CLUSTER" \
+            --arg victim_job "$VICTIM_JOB" \
+            '{
+              source:{storage:$source_storage,deployment:$source_deployment,cluster:$source_cluster,job:$source_job},
+              victim:{storage:$victim_storage,deployment:$victim_deployment,cluster:$victim_cluster,job:$victim_job}
+            }' > evidence/digests.json
+
+          {
+            printf 'label\tstatus\n'
+            for status_file in evidence/*.status
+            do
+              label="$(basename "$status_file" .status)"
+              printf '%s\t%s\n' "$label" "$(tr -d '\r\n' < "$status_file")"
+            done
+          } > evidence/status-matrix.tsv
+          rm -f "$auth_cfg"
+
+      - name: Upload source matrix evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifact-metadata-source-matrix
+          path: evidence
+          if-no-files-found: error
+          retention-days: 7
